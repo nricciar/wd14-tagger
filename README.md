@@ -10,5 +10,6 @@ Arguments:
 
 Options:
   -o, --output <OUTPUT>  Optional output file to write results
+  -m, --model <MODEL>    Model backend to use [default: wd14] [possible values: wd14, dino]
   -h, --help             Print help
 ```
