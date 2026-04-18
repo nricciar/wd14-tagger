@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::sync::Arc;
 use std::{fs::File, io::Write, process::exit};
 
 mod predictor;
@@ -23,6 +24,18 @@ struct Args {
 }
 
 fn main() {
+    ort::init()
+        .with_logger(Arc::new(
+            |_level: ort::logging::LogLevel,
+             _category: &str,
+             _id: &str,
+             _code_location: &str,
+             _message: &str| {
+                //println!("ORT: {}", message);
+            },
+        ))
+        .commit();
+
     let args = Args::parse();
 
     let mut pred = Predictor::new(args.model);

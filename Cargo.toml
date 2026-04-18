@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ort = { version = "2.0.0-rc.12", features = ["ndarray","cuda","tensorrt"] }
+ort = { version = "2.0.0-rc.12", features = ["ndarray","cuda","load-dynamic"] }
 reqwest = { version = "0.11", features = ["blocking", "rustls-tls"] }
 csv = "1.1"
 serde = { version = "1.0", features = ["derive"] }

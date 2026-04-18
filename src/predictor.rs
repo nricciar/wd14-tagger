@@ -17,8 +17,12 @@ pub const WD14_TAG_CSV: &str = "SmilingWolf/wd-vit-large-tagger-v3/tags_info.csv
 pub const DINO_ONNX_REPO: &str = "silveroxides/tagger-experiment-onnx";
 pub const DINO_TAGGER_MODEL: &str = "tagger/model.onnx";
 pub const DINO_TAGGER_DATA: &str = "tagger/model.onnx.data"; // must be beside model.onnx
+pub const DINO_TAGGER_MODEL_QUANT: &str = "tagger/model_quantized.onnx";
+
 pub const DINO_EMBED_MODEL: &str = "embedding/model.onnx";
 pub const DINO_EMBED_DATA: &str = "embedding/model.onnx.data";
+pub const DINO_EMBED_MODEL_QUANT: &str = "embedding/model_quantized.onnx";
+
 // Vocabulary lives in the original (non-ONNX) base repo.
 pub const DINO_BASE_REPO: &str = "lodestones/tagger-experiment";
 pub const DINO_VOCAB_FILE: &str = "tagger_vocab_with_categories.json";
@@ -28,8 +32,6 @@ const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 const DINO_PATCH_SIZE: u32 = 16;
 const DINO_MAX_SIZE: u32 = 1024;
-
-// ── Public model selector ─────────────────────────────────────────────────────
 
 #[derive(Serialize, Debug, Deserialize, Clone)]
 pub struct OutputData {
@@ -45,9 +47,9 @@ pub enum ModelKind {
     Wd14,
     #[value(name = "dino")]
     DINOv3,
+    #[value(name = "dino_q8")]
+    DINOv3Q8,
 }
-
-// ── Vocabulary / label types ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct Wd14TagRow {
@@ -66,8 +68,6 @@ struct DinoVocab {
     #[serde(default)]
     idx2cat: Vec<u8>,
 }
-
-// ── Label loaders ─────────────────────────────────────────────────────────────
 
 fn load_wd14_labels(
     repo_name: &str,
@@ -136,8 +136,6 @@ fn normalise_tag(name: &str) -> String {
     }
 }
 
-// ── Image preprocessing ───────────────────────────────────────────────────────
-
 /// WD14: centre-pad to square → fixed resize → BGR channel order
 /// Output layout: BHWC `[1, H, W, 3]`, raw u8 cast to f32.
 fn prepare_wd14(img: &DynamicImage, size: usize) -> Array4<f32> {
@@ -196,8 +194,6 @@ fn prepare_dinov3(img: &DynamicImage) -> Array4<f32> {
     }
     arr
 }
-
-// ── Post-processing helpers ───────────────────────────────────────────────────
 
 #[inline]
 fn sigmoid(x: f32) -> f32 {
@@ -271,8 +267,6 @@ fn build_output(
     }
 }
 
-// ── Internal loaded-model state ───────────────────────────────────────────────
-
 enum LoadedModel {
     Wd14 {
         session: Session,
@@ -283,8 +277,6 @@ enum LoadedModel {
         embedder: Option<Session>, // None if embedding/model.onnx is unavailable
     },
 }
-
-// ── Public Predictor ──────────────────────────────────────────────────────────
 
 pub struct Predictor {
     kind: ModelKind,
@@ -313,7 +305,7 @@ impl Predictor {
         }
         match self.kind {
             ModelKind::Wd14 => self.load_wd14(),
-            ModelKind::DINOv3 => self.load_dinov3(),
+            ModelKind::DINOv3 | ModelKind::DINOv3Q8 => self.load_dinov3(),
         }
     }
 
@@ -330,7 +322,9 @@ impl Predictor {
 
         let session = Session::builder()
             .unwrap()
-            .with_execution_providers([ep::CUDA::default().build()])
+            .with_execution_providers([ep::CUDA::default()
+                .with_device_id(0)
+                .build()])
             .unwrap()
             .commit_from_file(model_path)
             .unwrap();
@@ -347,12 +341,18 @@ impl Predictor {
         let api = Api::new().unwrap();
         let onnx_repo = api.model(DINO_ONNX_REPO.to_string());
 
-        // hf_hub preserves the repo's directory tree under
-        // ~/.cache/huggingface/hub/.../snapshots/<rev>/
-        // so model.onnx and model.onnx.data land in the same folder,
-        // which is what ONNX Runtime needs to find the external-data sidecar.
-        let tagger_path = onnx_repo.get(DINO_TAGGER_MODEL).unwrap();
-        let _ = onnx_repo.get(DINO_TAGGER_DATA).unwrap();
+        let quant = self.kind == ModelKind::DINOv3Q8;
+
+        let (tagger_model, embed_model): (&str, &str) = if quant {
+            (DINO_TAGGER_MODEL_QUANT, DINO_EMBED_MODEL_QUANT)
+        } else {
+            (DINO_TAGGER_MODEL, DINO_EMBED_MODEL)
+        };
+
+        let tagger_path = onnx_repo.get(tagger_model).unwrap();
+        if !quant {
+            let _ = onnx_repo.get(DINO_TAGGER_DATA).unwrap();
+        }
 
         let (tags, r, g, c) = load_dino_labels(DINO_BASE_REPO, DINO_VOCAB_FILE);
         self.tag_names = tags;
@@ -362,17 +362,22 @@ impl Predictor {
 
         let tagger = Session::builder()
             .unwrap()
-            .with_execution_providers([ep::CUDA::default().build()])
+            .with_execution_providers([ep::CUDA::default()
+                .with_device_id(0)
+                .build()])
             .unwrap()
             .commit_from_file(tagger_path)
             .unwrap();
 
-        // Embedder is optional; skip cleanly if the files aren't present.
-        let embedder = onnx_repo.get(DINO_EMBED_MODEL).ok().map(|emb_path| {
-            let _ = onnx_repo.get(DINO_EMBED_DATA).ok();
+        let embedder = onnx_repo.get(embed_model).ok().map(|emb_path| {
+            if !quant {
+                let _ = onnx_repo.get(DINO_EMBED_DATA).ok();
+            }
             Session::builder()
                 .unwrap()
-                .with_execution_providers([ep::CUDA::default().build()])
+                .with_execution_providers([ep::CUDA::default()
+                    .with_device_id(0)
+                    .build()])
                 .unwrap()
                 .commit_from_file(emb_path)
                 .unwrap()
